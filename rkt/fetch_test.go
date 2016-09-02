@@ -37,6 +37,7 @@ import (
 	rktflag "github.com/coreos/rkt/rkt/flag"
 	"github.com/coreos/rkt/rkt/image"
 	"github.com/coreos/rkt/store/imagestore"
+	"github.com/coreos/rkt/store/treestore"
 )
 
 type httpError struct {
@@ -257,6 +258,10 @@ func TestDownloading(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
+	ts, err := treestore.NewStore(dir, s)
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
 
 	for _, tt := range tests {
 		_, ok, err := s.GetRemote(tt.ACIURL)
@@ -278,6 +283,7 @@ func TestDownloading(t *testing.T) {
 		}
 		ft := &image.Fetcher{
 			S:             s,
+			Ts:            ts,
 			Headers:       headers,
 			InsecureFlags: insecureFlags,
 		}
