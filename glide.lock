@@ -1,5 +1,5 @@
-hash: d4f696c75b3692bcd02b8bf9213877c29ba64e88d7f2d6f2135e90758fbb077a
-updated: 2016-10-13T18:05:27.417987016+02:00
+hash: 1b080b89df0dc50ee1a6f631f0514a3d4ebc084c088c6c6cc5b526ede7234168
+updated: 2016-10-24T15:30:06.860873327-07:00
 imports:
 - name: github.com/appc/docker2aci
   version: 15d68b33bfee95a448c4da37dbe876baa8fcb5b6
@@ -294,11 +294,10 @@ imports:
 - name: gopkg.in/inf.v0
   version: 3887ee99ecf07df5b447e9b00d9c0b2adaa9f3e4
 - name: k8s.io/kubernetes
-  version: 283137936a498aed572ee22af6774b6fb6e9fd94
+  version: 4957b090e9a4f6a68b4a40375408fdc74a212260
   subpackages:
   - pkg/api/resource
   - pkg/conversion
-  - third_party/forked/reflect
 testImports:
 - name: github.com/kr/text
   version: 7cafcd837844e784b526369c9bce262804aebc60
