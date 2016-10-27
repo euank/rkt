@@ -109,6 +109,7 @@ func addAppFlags(cmd *cobra.Command) {
 	cmd.Flags().Var((*appAnnotation)(&rktApps), "user-annotation", "set the app's annotations (example: '--user-annotation=foo=bar')")
 	cmd.Flags().Var((*appLabel)(&rktApps), "user-label", "set the app's labels (example: '--user-label=foo=bar')")
 	cmd.Flags().Var((*appEnv)(&rktApps), "environment", "set the app's environment variables (example: '--environment=foo=bar')")
+	cmd.Flags().Var((*appOCISpec)(&rktApps), "oci-spec", "provide as a json string a valid runc config.json. Ignores all other flags.")
 }
 
 func init() {

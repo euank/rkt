@@ -26,14 +26,12 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
 
 	"github.com/appc/goaci/proj2aci"
-	"github.com/appc/spec/schema/types"
 	"github.com/coreos/go-systemd/util"
 	"github.com/coreos/pkg/dlopen"
 	"github.com/godbus/dbus"
@@ -48,14 +46,11 @@ import (
 	"github.com/coreos/rkt/common/cgroup"
 	"github.com/coreos/rkt/common/cgroup/v1"
 	"github.com/coreos/rkt/common/cgroup/v2"
-	commonnet "github.com/coreos/rkt/common/networking"
 	"github.com/coreos/rkt/networking"
 	pkgflag "github.com/coreos/rkt/pkg/flag"
 	rktlog "github.com/coreos/rkt/pkg/log"
+	"github.com/coreos/rkt/pkg/oci"
 	"github.com/coreos/rkt/pkg/sys"
-	"github.com/coreos/rkt/stage1/init/kvm"
-	"github.com/coreos/rkt/stage1/init/kvm/hypervisor/hvlkvm"
-	"github.com/coreos/rkt/stage1/init/kvm/hypervisor/hvqemu"
 )
 
 const (
@@ -252,186 +247,37 @@ func getArgsEnv(p *stage1commontypes.Pod, flavor string, canMachinedRegister boo
 		return nil, nil, errwrap.Wrap(errors.New("failed to create flavor symlink"), err)
 	}
 
-	// set hostname inside pod
-	// According to systemd manual (https://www.freedesktop.org/software/systemd/man/hostname.html) :
-	// "The /etc/hostname file configures the name of the local system that is set
-	// during boot using the sethostname system call"
-	if hostname == "" {
-		hostname = stage1initcommon.GetMachineID(p)
-	}
-	hostnamePath := filepath.Join(common.Stage1RootfsPath(p.Root), "etc/hostname")
-	if err := ioutil.WriteFile(hostnamePath, []byte(hostname), 0644); err != nil {
-		return nil, nil, fmt.Errorf("error writing %s, %s", hostnamePath, err)
-	}
-
 	// systemd-nspawn needs /etc/machine-id to link the container's journal
 	// to the host. Since systemd-v230, /etc/machine-id is mandatory, see
 	// https://github.com/systemd/systemd/commit/e01ff70a77e781734e1e73a2238af2e9bf7967a8
 	mPath := filepath.Join(common.Stage1RootfsPath(p.Root), "etc", "machine-id")
 	machineID := strings.Replace(p.UUID.String(), "-", "", -1)
 
-	switch flavor {
-	case "kvm":
-		if privateUsers != "" {
-			return nil, nil, fmt.Errorf("flag --private-users cannot be used with an lkvm stage1")
-		}
+	args = append(args, filepath.Join(common.Stage1RootfsPath(p.Root), interpBin))
+	args = append(args, filepath.Join(common.Stage1RootfsPath(p.Root), nspawnBin))
+	args = append(args, "--boot")             // Launch systemd in the pod
+	args = append(args, "--notify-ready=yes") // From systemd v231
 
-		// kernel and hypervisor binaries are located relative to the working directory
-		// of init (/var/lib/rkt/..../uuid)
-		// TODO: move to path.go
-		kernelPath := filepath.Join(common.Stage1RootfsPath(p.Root), "bzImage")
-		netDescriptions := kvm.GetNetworkDescriptions(n)
-
-		cpu, mem := kvm.GetAppsResources(p.Manifest.Apps)
-
-		// Parse hypervisor
-		hv, err := KvmCheckHypervisor(common.Stage1RootfsPath(p.Root))
-		if err != nil {
-			return nil, nil, err
-		}
-
-		// Set start command for hypervisor
-		StartCmd := hvlkvm.StartCmd
-		switch hv {
-		case "lkvm":
-			StartCmd = hvlkvm.StartCmd
-		case "qemu":
-			StartCmd = hvqemu.StartCmd
-		default:
-			return nil, nil, fmt.Errorf("unrecognized hypervisor")
-		}
-
-		hvStartCmd := StartCmd(
-			common.Stage1RootfsPath(p.Root),
-			p.UUID.String(),
-			kernelPath,
-			netDescriptions,
-			cpu,
-			mem,
-			debug,
-		)
-
-		if hvStartCmd == nil {
-			return nil, nil, fmt.Errorf("no hypervisor")
-		}
-
-		args = append(args, hvStartCmd...)
-
-		// lkvm requires $HOME to be defined,
-		// see https://github.com/coreos/rkt/issues/1393
-		if os.Getenv("HOME") == "" {
-			env = append(env, "HOME=/root")
-		}
-
-		if err := linkJournal(common.Stage1RootfsPath(p.Root), machineID); err != nil {
-			return nil, nil, errwrap.Wrap(errors.New("error linking pod's journal"), err)
-		}
-
-		// use only dynamic libraries provided in the image
-		// from systemd v231 there's a new internal libsystemd-shared-v231.so
-		// which is present in /usr/lib/systemd
-		env = append(env, "LD_LIBRARY_PATH="+filepath.Join(common.Stage1RootfsPath(p.Root), "usr/lib/systemd"))
-
-		return args, env, nil
-
-	case "coreos":
-		args = append(args, filepath.Join(common.Stage1RootfsPath(p.Root), interpBin))
-		args = append(args, filepath.Join(common.Stage1RootfsPath(p.Root), nspawnBin))
-		args = append(args, "--boot")             // Launch systemd in the pod
-		args = append(args, "--notify-ready=yes") // From systemd v231
-
-		if context := os.Getenv(common.EnvSELinuxContext); context != "" {
-			args = append(args, fmt.Sprintf("-Z%s", context))
-		}
-
-		if context := os.Getenv(common.EnvSELinuxMountContext); context != "" {
-			args = append(args, fmt.Sprintf("-L%s", context))
-		}
-
-		if canMachinedRegister {
-			args = append(args, fmt.Sprintf("--register=true"))
-		} else {
-			args = append(args, fmt.Sprintf("--register=false"))
-		}
-
-		// use only dynamic libraries provided in the image
-		// from systemd v231 there's a new internal libsystemd-shared-v231.so
-		// which is present in /usr/lib/systemd
-		env = append(env, "LD_LIBRARY_PATH="+
-			filepath.Join(common.Stage1RootfsPath(p.Root), "usr/lib")+":"+
-			filepath.Join(common.Stage1RootfsPath(p.Root), "usr/lib/systemd"))
-
-	case "src":
-		args = append(args, filepath.Join(common.Stage1RootfsPath(p.Root), interpBin))
-		args = append(args, filepath.Join(common.Stage1RootfsPath(p.Root), nspawnBin))
-		args = append(args, "--boot")             // Launch systemd in the pod
-		args = append(args, "--notify-ready=yes") // From systemd v231
-
-		if context := os.Getenv(common.EnvSELinuxContext); context != "" {
-			args = append(args, fmt.Sprintf("-Z%s", context))
-		}
-
-		if context := os.Getenv(common.EnvSELinuxMountContext); context != "" {
-			args = append(args, fmt.Sprintf("-L%s", context))
-		}
-
-		if canMachinedRegister {
-			args = append(args, fmt.Sprintf("--register=true"))
-		} else {
-			args = append(args, fmt.Sprintf("--register=false"))
-		}
-
-		// use only dynamic libraries provided in the image
-		// from systemd v231 there's a new internal libsystemd-shared-v231.so
-		// which is present in /usr/lib/systemd
-		env = append(env, "LD_LIBRARY_PATH="+filepath.Join(common.Stage1RootfsPath(p.Root), "usr/lib/systemd"))
-
-	case "host":
-		hostNspawnBin, err := common.LookupPath("systemd-nspawn", os.Getenv("PATH"))
-		if err != nil {
-			return nil, nil, err
-		}
-
-		// Check dynamically which version is installed on the host
-		// Support version >= 220
-		versionBytes, err := exec.Command(hostNspawnBin, "--version").CombinedOutput()
-		if err != nil {
-			return nil, nil, errwrap.Wrap(fmt.Errorf("unable to probe %s version", hostNspawnBin), err)
-		}
-		versionStr := strings.SplitN(string(versionBytes), "\n", 2)[0]
-		var version int
-		n, err := fmt.Sscanf(versionStr, "systemd %d", &version)
-		if err != nil {
-			return nil, nil, fmt.Errorf("cannot parse version: %q", versionStr)
-		}
-		if n != 1 || version < 220 {
-			return nil, nil, fmt.Errorf("rkt needs systemd-nspawn >= 220. %s version not supported: %v", hostNspawnBin, versionStr)
-		}
-
-		// Copy systemd, bash, etc. in stage1 at run-time
-		if err := installAssets(); err != nil {
-			return nil, nil, errwrap.Wrap(errors.New("cannot install assets from the host"), err)
-		}
-
-		args = append(args, hostNspawnBin)
-		args = append(args, "--boot") // Launch systemd in the pod
-		args = append(args, fmt.Sprintf("--register=true"))
-
-		if version >= 231 {
-			args = append(args, "--notify-ready=yes") // From systemd v231
-		}
-
-		if context := os.Getenv(common.EnvSELinuxContext); context != "" {
-			args = append(args, fmt.Sprintf("-Z%s", context))
-		}
-
-		if context := os.Getenv(common.EnvSELinuxMountContext); context != "" {
-			args = append(args, fmt.Sprintf("-L%s", context))
-		}
-
-	default:
-		return nil, nil, fmt.Errorf("unrecognized stage1 flavor: %q", flavor)
+	if context := os.Getenv(common.EnvSELinuxContext); context != "" {
+		args = append(args, fmt.Sprintf("-Z%s", context))
 	}
+
+	if context := os.Getenv(common.EnvSELinuxMountContext); context != "" {
+		args = append(args, fmt.Sprintf("-L%s", context))
+	}
+
+	if canMachinedRegister {
+		args = append(args, fmt.Sprintf("--register=true"))
+	} else {
+		args = append(args, fmt.Sprintf("--register=false"))
+	}
+
+	// use only dynamic libraries provided in the image
+	// from systemd v231 there's a new internal libsystemd-shared-v231.so
+	// which is present in /usr/lib/systemd
+	env = append(env, "LD_LIBRARY_PATH="+
+		filepath.Join(common.Stage1RootfsPath(p.Root), "usr/lib")+":"+
+		filepath.Join(common.Stage1RootfsPath(p.Root), "usr/lib/systemd"))
 
 	machineIDBytes := append([]byte(machineID), '\n')
 	if err := ioutil.WriteFile(mPath, machineIDBytes, 0644); err != nil {
@@ -495,14 +341,15 @@ func getArgsEnv(p *stage1commontypes.Pod, flavor string, canMachinedRegister boo
 }
 
 func stage1() int {
-	uuid, err := types.NewUUID(flag.Arg(0))
-	if err != nil {
-		log.PrintE("UUID is missing or malformed", err)
+	args := flag.Args()
+	uuid := flag.Arg(0)
+	if uuid == "" {
+		log.Print("UUID is missing")
 		return 254
 	}
 
 	root := "."
-	p, err := stage1commontypes.LoadPod(root, uuid)
+	p, err := oci.LoadPod(root, uuid)
 	if err != nil {
 		log.PrintE("failed to load pod", err)
 		return 254
@@ -523,97 +370,7 @@ func stage1() int {
 
 	mirrorLocalZoneInfo(p.Root)
 
-	flavor, _, err := stage1initcommon.GetFlavor(p)
-	if err != nil {
-		log.PrintE("failed to get stage1 flavor", err)
-		return 254
-	}
-
-	var n *networking.Networking
-	if netList.Contained() {
-		fps, err := commonnet.ForwardedPorts(p.Manifest)
-		if err != nil {
-			log.Error(err)
-			return 254
-		}
-
-		noDNS := dnsConfMode.Pairs["resolv"] != "default" // force ignore CNI DNS results
-		n, err = networking.Setup(root, p.UUID, fps, netList, localConfig, flavor, noDNS, debug)
-		if err != nil {
-			log.PrintE("failed to setup network", err)
-			return 254
-		}
-
-		if err = n.Save(); err != nil {
-			log.PrintE("failed to save networking state", err)
-			n.Teardown(flavor, debug)
-			return 254
-		}
-
-		if len(mdsToken) > 0 {
-			hostIP, err := n.GetForwardableNetHostIP()
-			if err != nil {
-				log.PrintE("failed to get default Host IP", err)
-				return 254
-			}
-
-			p.MetadataServiceURL = common.MetadataServicePublicURL(hostIP, mdsToken)
-		}
-	} else {
-		if flavor == "kvm" {
-			log.Print("flavor kvm requires private network configuration (try --net)")
-			return 254
-		}
-		if len(mdsToken) > 0 {
-			p.MetadataServiceURL = common.MetadataServicePublicURL(localhostIP, mdsToken)
-		}
-	}
-
-	insecureOptions := stage1initcommon.Stage1InsecureOptions{
-		DisablePaths:        disablePaths,
-		DisableCapabilities: disableCapabilities,
-		DisableSeccomp:      disableSeccomp,
-	}
-
-	if dnsConfMode.Pairs["resolv"] == "host" {
-		stage1initcommon.UseHostResolv(root)
-	}
-
-	if dnsConfMode.Pairs["hosts"] == "host" {
-		stage1initcommon.UseHostHosts(root)
-	}
-
-	if mutable {
-		if err = stage1initcommon.MutableEnv(p); err != nil {
-			log.Error(err)
-			return 254
-		}
-	} else {
-		if err = stage1initcommon.ImmutableEnv(p, interactive, privateUsers, insecureOptions); err != nil {
-			log.Error(err)
-			return 254
-		}
-	}
-
-	if err := stage1initcommon.SetJournalPermissions(p); err != nil {
-		log.PrintE("warning: error setting journal ACLs, you'll need root to read the pod journal", err)
-	}
-
-	if flavor == "kvm" {
-		kvm.InitDebug(debug)
-		if err := KvmNetworkingToSystemd(p, n); err != nil {
-			log.PrintE("failed to configure systemd for kvm", err)
-			return 254
-		}
-	}
-
-	canMachinedRegister := false
-	if flavor != "kvm" {
-		// kvm doesn't register with systemd right now, see #2664.
-		canMachinedRegister = machinedRegister()
-	}
-	args, env, err := getArgsEnv(p, flavor, canMachinedRegister, debug, n, insecureOptions)
-	if err != nil {
+	if err = stage1initcommon.MutableEnv(p); err != nil {
 		log.Error(err)
 		return 254
 	}
@@ -642,21 +399,6 @@ func stage1() int {
 		return 254
 	}
 
-	s1Root := common.Stage1RootfsPath(p.Root)
-	machineID := stage1initcommon.GetMachineID(p)
-
-	subcgroup, err := getContainerSubCgroup(machineID, canMachinedRegister, unifiedCgroup)
-	if err != nil {
-		log.FatalE("error getting container subcgroup", err)
-		return 254
-	}
-
-	if err := ioutil.WriteFile(filepath.Join(p.Root, "subcgroup"),
-		[]byte(fmt.Sprintf("%s", subcgroup)), 0644); err != nil {
-		log.FatalE("cannot write subcgroup file", err)
-		return 254
-	}
-
 	if !unifiedCgroup {
 		enabledCgroups, err := v1.GetEnabledCgroups()
 		if err != nil {
@@ -668,42 +410,19 @@ func stage1() int {
 			log.FatalE("couldn't mount the host v1 cgroups", err)
 			return 254
 		}
-
-		var serviceNames []string
-		for _, app := range p.Manifest.Apps {
-			serviceNames = append(serviceNames, stage1initcommon.ServiceUnitName(app.Name))
-		}
-
-		if err := mountContainerV1Cgroups(s1Root, enabledCgroups, subcgroup, serviceNames); err != nil {
-			log.PrintE("couldn't mount the container v1 cgroups", err)
-			return 254
-		}
-
 	}
 
-	// KVM flavor has a bit different logic in handling pid vs ppid, for details look into #2389
-	// it doesn't require the existence of a "ppid", instead it registers the current pid (which
-	// will be reused by lkvm binary) as a pod process pid used during entering
 	pid_filename := "ppid"
-	if flavor == "kvm" {
-		pid_filename = "pid"
-	}
 
 	if err = stage1common.WritePid(os.Getpid(), pid_filename); err != nil {
 		log.Error(err)
 		return 254
 	}
 
-	if flavor == "kvm" {
-		if err := KvmPrepareMounts(s1Root, p); err != nil {
-			log.PrintE("could not prepare mounts", err)
-			return 254
-		}
-	}
 	diag.Println(args)
 
 	err = stage1common.WithClearedCloExec(lfd, func() error {
-		return syscall.Exec(args[0], args, env)
+		return syscall.Exec(args[0], args, []string{})
 	})
 	if err != nil {
 		log.PrintE(fmt.Sprintf("failed to execute %q", args[0]), err)

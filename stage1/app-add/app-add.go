@@ -28,28 +28,18 @@ import (
 	"github.com/coreos/rkt/common/cgroup"
 	"github.com/coreos/rkt/common/cgroup/v1"
 	rktlog "github.com/coreos/rkt/pkg/log"
-	stage1types "github.com/coreos/rkt/stage1/common/types"
+	"github.com/coreos/rkt/pkg/oci"
 	stage1initcommon "github.com/coreos/rkt/stage1/init/common"
-
-	"github.com/appc/spec/schema/types"
 )
 
 var (
-	debug               bool
-	disableCapabilities bool
-	disablePaths        bool
-	disableSeccomp      bool
-	privateUsers        string
-	log                 *rktlog.Logger
-	diag                *rktlog.Logger
+	debug bool
+	log   *rktlog.Logger
+	diag  *rktlog.Logger
 )
 
 func init() {
 	flag.BoolVar(&debug, "debug", false, "Run in debug mode")
-	flag.BoolVar(&disableCapabilities, "disable-capabilities-restriction", false, "Disable capability restrictions")
-	flag.BoolVar(&disablePaths, "disable-paths", false, "Disable paths restrictions")
-	flag.BoolVar(&disableSeccomp, "disable-seccomp", false, "Disable seccomp restrictions")
-	flag.StringVar(&privateUsers, "private-users", "", "Run within user namespace. Can be set to [=UIDBASE[:NUIDS]]")
 }
 
 // TODO use named flags instead of positional
@@ -63,15 +53,15 @@ func main() {
 		diag.SetOutput(ioutil.Discard)
 	}
 
-	uuid, err := types.NewUUID(flag.Arg(0))
-	if err != nil {
-		log.PrintE("UUID is missing or malformed", err)
+	uuid := flag.Arg(0)
+	if uuid == "" {
+		log.Print("UUID is missing or malformed")
 		os.Exit(254)
 	}
 
-	appName, err := types.NewACName(flag.Arg(1))
-	if err != nil {
-		log.PrintE("invalid app name", err)
+	appName := flag.Arg(1)
+	if appName == "" {
+		log.Print("invalid app name")
 		os.Exit(254)
 	}
 
@@ -79,26 +69,10 @@ func main() {
 	enterCmd = append(enterCmd, fmt.Sprintf("--pid=%s", flag.Arg(3)), "--")
 
 	root := "."
-	p, err := stage1types.LoadPod(root, uuid)
+	p, err := oci.LoadPod(root, uuid)
 	if err != nil {
 		log.PrintE("failed to load pod", err)
 		os.Exit(254)
-	}
-
-	insecureOptions := stage1initcommon.Stage1InsecureOptions{
-		DisablePaths:        disablePaths,
-		DisableCapabilities: disableCapabilities,
-		DisableSeccomp:      disableSeccomp,
-	}
-
-	ra := p.Manifest.Apps.Get(*appName)
-	if ra == nil {
-		log.Printf("failed to get app")
-		os.Exit(254)
-	}
-
-	if ra.App.WorkingDirectory == "" {
-		ra.App.WorkingDirectory = "/"
 	}
 
 	/* prepare cgroups */
@@ -118,7 +92,7 @@ func main() {
 		b, err := ioutil.ReadFile(filepath.Join(p.Root, "subcgroup"))
 		if err == nil {
 			subcgroup := string(b)
-			serviceName := stage1initcommon.ServiceUnitName(ra.Name)
+			serviceName := stage1initcommon.ServiceUnitName(appName)
 
 			if err := v1.RemountCgroupKnobsRW(enabledCgroups, subcgroup, serviceName, enterCmd); err != nil {
 				log.FatalE("error restricting container cgroups", err)
@@ -129,18 +103,9 @@ func main() {
 		}
 	}
 
-	stage1initcommon.AppAddMounts(p, ra, enterCmd)
-
-	/* write service file */
-	binPath, err := stage1initcommon.FindBinPath(p, ra)
-	if err != nil {
-		log.PrintE("failed to find bin path", err)
-		os.Exit(254)
-	}
-
 	w := stage1initcommon.NewUnitWriter(p)
 
-	w.AppUnit(ra, binPath, privateUsers, insecureOptions,
+	w.AppUnit(bundlePath,
 		unit.NewUnitOption("Unit", "Before", "halt.target"),
 		unit.NewUnitOption("Unit", "Conflicts", "halt.target"),
 		unit.NewUnitOption("Service", "StandardOutput", "journal+console"),

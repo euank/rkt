@@ -47,6 +47,7 @@ import (
 	"github.com/coreos/rkt/pkg/aci"
 	"github.com/coreos/rkt/pkg/fileutil"
 	"github.com/coreos/rkt/pkg/label"
+	rktoci "github.com/coreos/rkt/pkg/oci"
 	"github.com/coreos/rkt/pkg/sys"
 	"github.com/coreos/rkt/pkg/tpm"
 	"github.com/coreos/rkt/pkg/user"
@@ -96,6 +97,7 @@ type RunConfig struct {
 
 // CommonConfig defines the configuration shared by both Run and Prepare
 type CommonConfig struct {
+	Type         rktoci.PodType
 	Store        *imagestore.Store // store containing all of the configured application images
 	TreeStore    *treestore.Store  // store containing all of the configured application images
 	Stage1Image  types.Hash        // stage1 image containing usable /init and /enter entrypoints
@@ -184,6 +186,22 @@ func deduplicateMPs(mounts []schema.Mount) []schema.Mount {
 func MergeMounts(mounts []schema.Mount, appMounts []schema.Mount) []schema.Mount {
 	ml := append(appMounts, mounts...)
 	return deduplicateMPs(ml)
+}
+
+// generateOCIPodManifest generates an OCI pod manifest
+func generateOCIPodManifest(cfg PrepareConfig, dir string) ([]byte, error) {
+	annos := map[string]string{
+		"coreos.com/rkt/stage1/mutable": "true",
+		"coreos.com/rkt/stage1/type":    "oci",
+	}
+	pmb, err := json.Marshal(&rktoci.OCIPodManifest{
+		Version:     "0.0.1",
+		Annotations: annos,
+	})
+	if err != nil {
+		return nil, errwrap.Wrap(errors.New("unable to marshal OCIPodManifest"), err)
+	}
+	return pmb, nil
 }
 
 // generatePodManifest creates the pod manifest from the command line input.
@@ -474,7 +492,10 @@ func Prepare(cfg PrepareConfig, dir string, uuid *types.UUID) error {
 
 	var pmb []byte
 	var err error
-	if len(cfg.PodManifest) > 0 {
+
+	if cfg.Type == rktoci.PodTypeOCI {
+		pmb, err = generateOCIPodManifest(cfg, dir)
+	} else if len(cfg.PodManifest) > 0 {
 		pmb, err = validatePodManifest(cfg, dir)
 	} else {
 		pmb, err = generatePodManifest(cfg, dir)
@@ -492,8 +513,13 @@ func Prepare(cfg PrepareConfig, dir string, uuid *types.UUID) error {
 	}
 	f.Close()
 
+	var fn string
 	debug("Writing pod manifest")
-	fn := common.PodManifestPath(dir)
+	if cfg.Type == rktoci.PodTypeOCI {
+		fn = common.OCIPodManifestPath(dir)
+	} else {
+		fn = common.PodManifestPath(dir)
+	}
 	if err := ioutil.WriteFile(fn, pmb, common.DefaultRegularFilePerm); err != nil {
 		return errwrap.Wrap(errors.New("error writing pod manifest"), err)
 	}
@@ -600,9 +626,72 @@ func writeEtcHosts(cfg *RunConfig, rootfs string) {
 	}
 }
 
+func runOCIStage1(cfg RunConfig, dir string, dataDir string) {
+	// TODO, userns
+	debug("Setting up stage1")
+	if err := setupStage1Image(cfg, dir, cfg.UseOverlay); err != nil {
+		log.FatalE("error setting up stage1", err)
+	}
+	debug("Wrote filesystem to %s\n", dir)
+
+	for _, app := range cfg.Apps {
+		if err := setupAppImage(cfg, app.Name, app.Image.ID, dir, cfg.UseOverlay); err != nil {
+			log.FatalE("error setting up app image", err)
+		}
+	}
+
+	destRootfs := common.Stage1RootfsPath(dir)
+
+	writeDnsConfig(&cfg, destRootfs)
+
+	if err := os.Setenv(common.EnvLockFd, fmt.Sprintf("%v", cfg.LockFd)); err != nil {
+		log.FatalE("setting lock fd environment", err)
+	}
+
+	debug("Pivoting to filesystem %s", dir)
+	if err := os.Chdir(dir); err != nil {
+		log.FatalE("failed changing to dir", err)
+	}
+
+	ep, err := getStage1Entrypoint(dir, runEntrypoint)
+	if err != nil {
+		log.FatalE("error determining 'run' entrypoint", err)
+	}
+	args := []string{filepath.Join(destRootfs, ep)}
+
+	if cfg.Debug {
+		args = append(args, "--debug")
+	}
+
+	// TODO net; should be included in the OCIPodManifest
+
+	// make sure the lock fd stays open across exec
+	if err := sys.CloseOnExec(cfg.LockFd, false); err != nil {
+		log.Fatalf("error clearing FD_CLOEXEC on lock fd")
+	}
+
+	tpmEvent := fmt.Sprintf("rkt: Rootfs: %s Manifest: %s Stage1 args: %s", cfg.CommonConfig.RootHash, cfg.CommonConfig.ManifestData, strings.Join(args, " "))
+	// If there's no TPM available or there's a failure for some other
+	// reason, ignore it and continue anyway. Long term we'll want policy
+	// that enforces TPM behaviour, but we don't have any infrastructure
+	// around that yet.
+	_ = tpm.Extend(tpmEvent)
+
+	args = append(args, cfg.UUID.String())
+
+	debug("Execing %s", args)
+	if err := syscall.Exec(args[0], args, os.Environ()); err != nil {
+		log.FatalE("error execing init", err)
+	}
+}
+
 // Run mounts the right overlay filesystems and actually runs the prepared
 // pod by exec()ing the stage1 init inside the pod filesystem.
 func Run(cfg RunConfig, dir string, dataDir string) {
+	if cfg.CommonConfig.Type == rktoci.PodTypeOCI {
+		runOCIStage1(cfg, dir, dataDir)
+	}
+
 	privateUsers, err := preparedWithPrivateUsers(dir)
 	if err != nil {
 		log.FatalE("error preparing private users", err)

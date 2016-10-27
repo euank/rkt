@@ -22,7 +22,6 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -176,50 +175,6 @@ func findHostPort(pm schema.PodManifest, name types.ACName) uint {
 		}
 	}
 	return port
-}
-
-// generateSysusers generates systemd sysusers files for a given app so that
-// corresponding entries in /etc/passwd and /etc/group are created in stage1.
-// This is needed to use the "User=" and "Group=" options in the systemd
-// service files of apps.
-// If there're several apps defining the same UIDs/GIDs, systemd will take care
-// of only generating one /etc/{passwd,group} entry
-func generateSysusers(p *stage1commontypes.Pod, ra *schema.RuntimeApp, uid_ int, gid_ int, uidRange *user.UidRange) error {
-	var toShift []string
-
-	app := ra.App
-	appName := ra.Name
-
-	sysusersDir := path.Join(common.Stage1RootfsPath(p.Root), "usr/lib/sysusers.d")
-	toShift = append(toShift, sysusersDir)
-	if err := os.MkdirAll(sysusersDir, 0755); err != nil {
-		return err
-	}
-
-	gids := append(app.SupplementaryGIDs, gid_)
-
-	// Create the Unix user and group
-	var sysusersConf []string
-
-	for _, g := range gids {
-		groupname := "gen" + strconv.Itoa(g)
-		sysusersConf = append(sysusersConf, fmt.Sprintf("g %s %d\n", groupname, g))
-	}
-
-	username := "gen" + strconv.Itoa(uid_)
-	sysusersConf = append(sysusersConf, fmt.Sprintf("u %s %d \"%s\"\n", username, uid_, username))
-
-	sysusersFile := path.Join(common.Stage1RootfsPath(p.Root), "usr/lib/sysusers.d", ServiceUnitName(appName)+".conf")
-	toShift = append(toShift, sysusersFile)
-	if err := ioutil.WriteFile(sysusersFile, []byte(strings.Join(sysusersConf, "\n")), 0640); err != nil {
-		return err
-	}
-
-	if err := user.ShiftFiles(toShift, uidRange); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // lookupPathInsideApp returns the path (relative to the app rootfs) of the

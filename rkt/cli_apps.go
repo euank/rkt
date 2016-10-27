@@ -711,6 +711,26 @@ func (au *appEnv) Type() string {
 	return "appEnv"
 }
 
+type appOCISpec apps.Apps
+
+func (acj *appOCISpec) Set(s string) error {
+	app := (*apps.Apps)(acj).Last()
+	app.OCISpec = s
+	return nil
+}
+
+func (acj *appOCISpec) String() string {
+	app := (*apps.Apps)(acj).Last()
+	if app == nil {
+		return ""
+	}
+	return app.OCISpec
+}
+
+func (acj *appOCISpec) Type() string {
+	return "appOCISpec"
+}
+
 type appWorkingDir apps.Apps
 
 func (au *appWorkingDir) Set(s string) error {

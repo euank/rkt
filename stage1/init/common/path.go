@@ -19,8 +19,6 @@ package common
 import (
 	"path/filepath"
 
-	"github.com/appc/spec/schema/types"
-	"github.com/coreos/go-systemd/unit"
 	"github.com/coreos/rkt/common"
 )
 
@@ -33,13 +31,13 @@ const (
 )
 
 // ServiceUnitName returns a systemd service unit name for the given app name.
-func ServiceUnitName(appName types.ACName) string {
-	return appName.String() + ".service"
+func ServiceUnitName(appName string) string {
+	return appName + ".service"
 }
 
 // ServiceUnitPath returns the path to the systemd service file for the given
 // app name.
-func ServiceUnitPath(root string, appName types.ACName) string {
+func ServiceUnitPath(root string, appName string) string {
 	return filepath.Join(common.Stage1RootfsPath(root), UnitsDir, ServiceUnitName(appName))
 }
 
@@ -51,41 +49,28 @@ func TargetUnitPath(root string, name string) string {
 
 // RelEnvFilePath returns the path to the environment file for the given
 // app name relative to the pod's root.
-func RelEnvFilePath(appName types.ACName) string {
-	return filepath.Join(envDir, appName.String())
-}
-
-// EnvFilePath returns the path to the environment file for the given app name.
-func EnvFilePath(root string, appName types.ACName) string {
-	return filepath.Join(common.Stage1RootfsPath(root), RelEnvFilePath(appName))
+func RelEnvFilePath(appName string) string {
+	return filepath.Join(envDir, appName)
 }
 
 // ServiceWantPath returns the systemd default.target want symlink path for the
 // given app name.
-func ServiceWantPath(root string, appName types.ACName) string {
+func ServiceWantPath(root string, appName string) string {
 	return filepath.Join(common.Stage1RootfsPath(root), defaultWantsDir, ServiceUnitName(appName))
 }
 
-// InstantiatedPrepareAppUnitName returns the systemd service unit name for prepare-app
-// instantiated for the given root.
-func InstantiatedPrepareAppUnitName(appName types.ACName) string {
-	// Naming respecting escaping rules, see systemd.unit(5) and systemd-escape(1)
-	escapedRoot := unit.UnitNamePathEscape(common.RelAppRootfsPath(appName))
-	return "prepare-app@-" + escapedRoot + ".service"
-}
-
 // SocketUnitName returns a systemd socket unit name for the given app name.
-func SocketUnitName(appName types.ACName) string {
-	return appName.String() + ".socket"
+func SocketUnitName(appName string) string {
+	return appName + ".socket"
 }
 
 // SocketUnitPath returns the path to the systemd socket file for the given app name.
-func SocketUnitPath(root string, appName types.ACName) string {
+func SocketUnitPath(root string, appName string) string {
 	return filepath.Join(common.Stage1RootfsPath(root), UnitsDir, SocketUnitName(appName))
 }
 
 // SocketWantPath returns the systemd sockets.target.wants symlink path for the
 // given app name.
-func SocketWantPath(root string, appName types.ACName) string {
+func SocketWantPath(root string, appName string) string {
 	return filepath.Join(common.Stage1RootfsPath(root), socketsWantsDir, SocketUnitName(appName))
 }

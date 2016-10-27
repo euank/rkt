@@ -23,6 +23,7 @@ import (
 
 	"github.com/appc/spec/schema/types"
 	"github.com/coreos/rkt/common/apps"
+	"github.com/coreos/rkt/pkg/oci"
 	"github.com/coreos/rkt/rkt/config"
 	"github.com/coreos/rkt/rkt/image"
 	"github.com/coreos/rkt/store/imagestore"
@@ -152,6 +153,8 @@ var (
 		kind:     stage1ImageLocationUnset,
 		location: "",
 	}
+
+	stage1Type oci.PodType
 )
 
 // addStage1ImageFlags adds flags for specifying custom stage1 image
@@ -163,6 +166,9 @@ func addStage1ImageFlags(flags *pflag.FlagSet) {
 		}
 		flags.Var(wrapper, data.flag, data.help)
 	}
+
+	// TODO, maybe we can parse stage1 annotations to set this
+	flags.Var(&stage1Type, "stage1-type", "optional, sets whether this is an appc or oci stage1. Defaults to appc")
 }
 
 // getStage1Hash will try to get the hash of stage1 to use.

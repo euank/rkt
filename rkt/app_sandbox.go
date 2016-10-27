@@ -24,6 +24,7 @@ import (
 	"github.com/coreos/rkt/common"
 	"github.com/coreos/rkt/pkg/label"
 	"github.com/coreos/rkt/pkg/lock"
+	"github.com/coreos/rkt/pkg/oci"
 	"github.com/coreos/rkt/pkg/pod"
 	"github.com/coreos/rkt/pkg/user"
 	"github.com/coreos/rkt/stage0"
@@ -109,6 +110,7 @@ func runAppSandbox(cmd *cobra.Command, args []string) int {
 
 	p.MountLabel = mountLabel
 	cfg := stage0.CommonConfig{
+		Type:         stage1Type,
 		MountLabel:   mountLabel,
 		ProcessLabel: processLabel,
 		Store:        s,
@@ -204,12 +206,14 @@ func runAppSandbox(cmd *cobra.Command, args []string) int {
 		HostsEntries:         *HostsEntries,
 	}
 
-	_, manifest, err := p.PodManifest()
-	if err != nil {
-		stderr.PrintE("cannot get the pod manifest", err)
-		return 1
+	if cfg.Type != oci.PodTypeOCI {
+		_, manifest, err := p.PodManifest()
+		if err != nil {
+			stderr.PrintE("cannot get the pod manifest", err)
+			return 1
+		}
+		rcfg.Apps = manifest.Apps
 	}
-	rcfg.Apps = manifest.Apps
 	stage0.Run(rcfg, p.Path(), getDataDir()) // execs, never returns
 
 	return 1

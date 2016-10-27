@@ -102,6 +102,11 @@ func PodManifestPath(root string) string {
 	return filepath.Join(root, "pod")
 }
 
+// OCIPodManifestPath returns the path in root to the Pod Manifest
+func OCIPodManifestPath(root string) string {
+	return filepath.Join(root, "ocipod")
+}
+
 // PodManifestLockPath returns the path in root to the Pod Manifest lock file.
 // This must be different from the PodManifestPath since mutations on the pod manifest file
 // happen by overwriting the original file.

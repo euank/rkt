@@ -69,6 +69,11 @@ type App struct {
 
 	// TODO(jonboulle): These images are partially-populated hashes, this should be clarified.
 	ImageID types.Hash // resolved image identifier
+
+	// OCISpec is an OCI compliant runtime spec. See
+	// https://github.com/opencontainers/runtime-spec
+	// It does not interact with any of the other flags currently, other than image and name
+	OCISpec string
 }
 
 type Apps struct {
