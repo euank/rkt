@@ -715,6 +715,9 @@ type appOCISpec apps.Apps
 
 func (acj *appOCISpec) Set(s string) error {
 	app := (*apps.Apps)(acj).Last()
+	if app == nil {
+		return fmt.Errorf("--oci-spec must follow an image")
+	}
 	app.OCISpec = s
 	return nil
 }

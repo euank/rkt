@@ -103,20 +103,16 @@ func main() {
 		}
 	}
 
+	bundlePath := filepath.Join(p.Root, appName)
 	w := stage1initcommon.NewUnitWriter(p)
-
 	w.AppUnit(bundlePath,
 		unit.NewUnitOption("Unit", "Before", "halt.target"),
 		unit.NewUnitOption("Unit", "Conflicts", "halt.target"),
 		unit.NewUnitOption("Service", "StandardOutput", "journal+console"),
 		unit.NewUnitOption("Service", "StandardError", "journal+console"),
 	)
-
-	w.AppReaperUnit(ra.Name, binPath)
-
-	if err := w.Error(); err != nil {
-		log.PrintE("error generating app units", err)
-		os.Exit(254)
+	if w.Error() != nil {
+		log.PrintE("Error creating service", w.Error())
 	}
 
 	args := enterCmd

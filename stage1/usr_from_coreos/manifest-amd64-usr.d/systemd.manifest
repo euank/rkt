@@ -1,3 +1,4 @@
+bin/runc
 bin/coredumpctl
 bin/journalctl
 bin/mount

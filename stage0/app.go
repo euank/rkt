@@ -30,6 +30,7 @@ import (
 	"github.com/coreos/rkt/common"
 	"github.com/coreos/rkt/common/apps"
 	"github.com/coreos/rkt/pkg/lock"
+	"github.com/coreos/rkt/pkg/oci"
 	"github.com/coreos/rkt/pkg/user"
 	// FIXME this should not be in stage1 anymore
 	stage1types "github.com/coreos/rkt/stage1/common/types"
@@ -75,6 +76,60 @@ type RmConfig struct {
 	PodPID      int
 }
 
+func addOCIApp(p *oci.OCIPod, appName types.ACName, cfg AddConfig) error {
+	cdir := cfg.PodPath
+	app := cfg.Apps.Last()
+	rcfg := RunConfig{
+		CommonConfig: cfg.CommonConfig,
+		UseOverlay:   cfg.UsesOverlay,
+	}
+
+	ad := common.AppPath(cdir, appName)
+	err := os.MkdirAll(ad, common.DefaultRegularDirPerm)
+	if err != nil {
+		return errwrap.Wrap(errors.New("error creating image directory"), err)
+	}
+	pcfg := PrepareConfig{
+		CommonConfig: cfg.CommonConfig,
+		PrivateUsers: user.NewBlankUidRange(),
+	}
+	treeStoreID, err := prepareAppImage(pcfg, appName, cfg.Image, cfg.PodPath, cfg.UsesOverlay)
+	if err != nil {
+		return errwrap.Wrap(fmt.Errorf("error preparing image %s", cfg.Image), err)
+	}
+
+	err = ioutil.WriteFile(filepath.Join(common.AppPath(cdir, appName), "config.json"), []byte(app.OCISpec), 0777)
+	if err != nil {
+		return errwrap.Wrap(errors.New("Could not write config.json"), err)
+	}
+
+	if err := overlayRender(rcfg, string(treeStoreID), cdir, ad, appName.String()); err != nil {
+		return errwrap.Wrap(errors.New("error rendering overlay filesystem"), err)
+	}
+
+	eep, err := getStage1Entrypoint(cfg.PodPath, enterEntrypoint)
+	if err != nil {
+		return errwrap.Wrap(errors.New("error determining 'enter' entrypoint"), err)
+	}
+
+	args := []string{
+		cfg.UUID.String(),
+		appName.String(),
+		filepath.Join(common.Stage1RootfsPath(cfg.PodPath), eep),
+		strconv.Itoa(cfg.PodPID),
+	}
+
+	if _, err := os.Create(common.AppCreatedPath(p.Root, appName.String())); err != nil {
+		return err
+	}
+
+	if err := callEntrypoint(cfg.PodPath, appAddEntrypoint, args); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func AddApp(cfg AddConfig) error {
 	// there should be only one app in the config
 	app := cfg.Apps.Last()
@@ -107,9 +162,13 @@ func AddApp(cfg AddConfig) error {
 	}
 	defer l.Close()
 
-	p, err := stage1types.LoadPod(cfg.PodPath, cfg.UUID)
-	if err != nil {
-		return errwrap.Wrap(errors.New("error loading pod manifest"), err)
+	p, lerr := stage1types.LoadPod(cfg.PodPath, cfg.UUID)
+	if lerr != nil {
+		if p, err := oci.LoadPod(cfg.PodPath, cfg.UUID.String()); err != nil {
+			return errwrap.Wrap(errors.New("error loading pod manifest"), lerr)
+		} else {
+			return addOCIApp(p, *appName, cfg)
+		}
 	}
 
 	pm := p.Manifest

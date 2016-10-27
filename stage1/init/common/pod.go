@@ -19,15 +19,13 @@ package common
 import (
 	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/coreos/rkt/pkg/acl"
+	"github.com/coreos/rkt/pkg/oci"
 	stage1commontypes "github.com/coreos/rkt/stage1/common/types"
 
 	"github.com/appc/spec/schema"
@@ -87,94 +85,6 @@ func quoteExec(exec []string) string {
 		qexec = append(qexec, escArg)
 	}
 	return strings.Join(qexec, " ")
-}
-
-func writeAppReaper(p *stage1commontypes.Pod, appName string, appRootDirectory string, binPath string) error {
-	opts := []*unit.UnitOption{
-		unit.NewUnitOption("Unit", "Description", fmt.Sprintf("%s Reaper", appName)),
-		unit.NewUnitOption("Unit", "DefaultDependencies", "false"),
-		unit.NewUnitOption("Unit", "StopWhenUnneeded", "yes"),
-		unit.NewUnitOption("Unit", "Wants", "shutdown.service"),
-		unit.NewUnitOption("Unit", "After", "shutdown.service"),
-		unit.NewUnitOption("Unit", "Conflicts", "exit.target"),
-		unit.NewUnitOption("Unit", "Conflicts", "halt.target"),
-		unit.NewUnitOption("Unit", "Conflicts", "poweroff.target"),
-		unit.NewUnitOption("Service", "RemainAfterExit", "yes"),
-		unit.NewUnitOption("Service", "ExecStop", fmt.Sprintf("/reaper.sh \"%s\" \"%s\" \"%s\"", appName, appRootDirectory, binPath)),
-	}
-
-	unitsPath := filepath.Join(common.Stage1RootfsPath(p.Root), UnitsDir)
-	file, err := os.OpenFile(filepath.Join(unitsPath, fmt.Sprintf("reaper-%s.service", appName)), os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return errwrap.Wrap(errors.New("failed to create service unit file"), err)
-	}
-	defer file.Close()
-
-	if _, err = io.Copy(file, unit.Serialize(opts)); err != nil {
-		return errwrap.Wrap(errors.New("failed to write service unit file"), err)
-	}
-
-	return nil
-}
-
-// SetJournalPermissions sets ACLs and permissions so the rkt group can access
-// the pod's logs
-func SetJournalPermissions(p *stage1commontypes.Pod) error {
-	s1 := common.Stage1ImagePath(p.Root)
-
-	rktgid, err := common.LookupGid(common.RktGroup)
-	if err != nil {
-		return fmt.Errorf("group %q not found", common.RktGroup)
-	}
-
-	journalPath := filepath.Join(s1, "rootfs", "var", "log", "journal")
-	if err := os.MkdirAll(journalPath, os.FileMode(0755)); err != nil {
-		return errwrap.Wrap(errors.New("error creating journal dir"), err)
-	}
-
-	a, err := acl.InitACL()
-	if err != nil {
-		return err
-	}
-	defer a.Free()
-
-	if err := a.ParseACL(fmt.Sprintf("g:%d:r-x,m:r-x", rktgid)); err != nil {
-		return errwrap.Wrap(errors.New("error parsing ACL string"), err)
-	}
-
-	if err := a.AddBaseEntries(journalPath); err != nil {
-		return errwrap.Wrap(errors.New("error adding base ACL entries"), err)
-	}
-
-	if err := a.Valid(); err != nil {
-		return err
-	}
-
-	if err := a.SetFileACLDefault(journalPath); err != nil {
-		return errwrap.Wrap(fmt.Errorf("error setting default ACLs on %q", journalPath), err)
-	}
-
-	return nil
-}
-
-func generateGidArg(gid int, supplGid []int) string {
-	arg := []string{strconv.Itoa(gid)}
-	for _, sg := range supplGid {
-		arg = append(arg, strconv.Itoa(sg))
-	}
-	return strings.Join(arg, ",")
-}
-
-// findHostPort returns the port number on the host that corresponds to an
-// image manifest port identified by name
-func findHostPort(pm schema.PodManifest, name types.ACName) uint {
-	var port uint
-	for _, p := range pm.Ports {
-		if p.Name == name {
-			port = p.HostPort
-		}
-	}
-	return port
 }
 
 // lookupPathInsideApp returns the path (relative to the app rootfs) of the
@@ -515,88 +425,20 @@ func appToNspawnArgs(p *stage1commontypes.Pod, ra *schema.RuntimeApp, insecureOp
 
 // PodToNspawnArgs renders a prepared Pod as a systemd-nspawn
 // argument list ready to be executed
-func PodToNspawnArgs(p *stage1commontypes.Pod, insecureOptions Stage1InsecureOptions) ([]string, error) {
+func PodToNspawnArgs(p *oci.OCIPod) ([]string, error) {
 	args := []string{
-		"--uuid=" + p.UUID.String(),
+		"--uuid=" + p.UUID,
 		"--machine=" + GetMachineID(p),
 		"--directory=" + common.Stage1RootfsPath(p.Root),
-	}
-
-	for i := range p.Manifest.Apps {
-		aa, err := appToNspawnArgs(p, &p.Manifest.Apps[i], insecureOptions)
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, aa...)
-	}
-
-	if insecureOptions.DisableCapabilities {
-		args = append(args, "--capability=all")
 	}
 
 	return args, nil
 }
 
-// GetFlavor populates a flavor string based on the flavor itself and respectively the systemd version
-// If the systemd version couldn't be guessed, it will be set to 0.
-func GetFlavor(p *stage1commontypes.Pod) (flavor string, systemdVersion int, err error) {
-	flavor, err = os.Readlink(filepath.Join(common.Stage1RootfsPath(p.Root), "flavor"))
-	if err != nil {
-		return "", -1, errwrap.Wrap(errors.New("unable to determine stage1 flavor"), err)
-	}
-
-	if flavor == "host" {
-		// This flavor does not contain systemd, parse "systemctl --version"
-		systemctlBin, err := common.LookupPath("systemctl", os.Getenv("PATH"))
-		if err != nil {
-			return "", -1, err
-		}
-
-		systemdVersion, err := common.SystemdVersion(systemctlBin)
-		if err != nil {
-			return "", -1, errwrap.Wrap(errors.New("error finding systemctl version"), err)
-		}
-
-		return flavor, systemdVersion, nil
-	}
-
-	systemdVersionBytes, err := ioutil.ReadFile(filepath.Join(common.Stage1RootfsPath(p.Root), "systemd-version"))
-	if err != nil {
-		return "", -1, errwrap.Wrap(errors.New("unable to determine stage1's systemd version"), err)
-	}
-	systemdVersionString := strings.Trim(string(systemdVersionBytes), " \n")
-
-	// systemdVersionString is either a tag name or a branch name. If it's a
-	// tag name it's of the form "v229", remove the first character to get the
-	// number.
-	systemdVersion, err = strconv.Atoi(systemdVersionString[1:])
-	if err != nil {
-		// If we get a syntax error, it means the parsing of the version string
-		// of the form "v229" failed, set it to 0 to indicate we couldn't guess
-		// it.
-		if e, ok := err.(*strconv.NumError); ok && e.Err == strconv.ErrSyntax {
-			systemdVersion = 0
-		} else {
-			return "", -1, errwrap.Wrap(errors.New("error parsing stage1's systemd version"), err)
-		}
-	}
-	return flavor, systemdVersion, nil
-}
-
-// GetAppHashes returns a list of hashes of the apps in this pod
-func GetAppHashes(p *stage1commontypes.Pod) []types.Hash {
-	var names []types.Hash
-	for _, a := range p.Manifest.Apps {
-		names = append(names, a.Image.ID)
-	}
-
-	return names
-}
-
 // GetMachineID returns the machine id string of the pod to be passed to
 // systemd-nspawn
-func GetMachineID(p *stage1commontypes.Pod) string {
-	return "rkt-" + p.UUID.String()
+func GetMachineID(p *oci.OCIPod) string {
+	return "rkt-" + p.UUID
 }
 
 // getAppCapabilities computes the set of Linux capabilities that an app

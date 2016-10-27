@@ -33,20 +33,15 @@ import (
 
 	"github.com/appc/goaci/proj2aci"
 	"github.com/coreos/go-systemd/util"
-	"github.com/coreos/pkg/dlopen"
-	"github.com/godbus/dbus"
-	"github.com/godbus/dbus/introspect"
 	"github.com/hashicorp/errwrap"
 
 	stage1common "github.com/coreos/rkt/stage1/common"
-	stage1commontypes "github.com/coreos/rkt/stage1/common/types"
 	stage1initcommon "github.com/coreos/rkt/stage1/init/common"
 
 	"github.com/coreos/rkt/common"
 	"github.com/coreos/rkt/common/cgroup"
 	"github.com/coreos/rkt/common/cgroup/v1"
 	"github.com/coreos/rkt/common/cgroup/v2"
-	"github.com/coreos/rkt/networking"
 	pkgflag "github.com/coreos/rkt/pkg/flag"
 	rktlog "github.com/coreos/rkt/pkg/log"
 	"github.com/coreos/rkt/pkg/oci"
@@ -115,24 +110,7 @@ var (
 
 func init() {
 	flag.BoolVar(&debug, "debug", false, "Run in debug mode")
-	flag.Var(&netList, "net", "Setup networking")
-	flag.BoolVar(&interactive, "interactive", false, "The pod is interactive")
-	flag.StringVar(&privateUsers, "private-users", "", "Run within user namespace. Can be set to [=UIDBASE[:NUIDS]]")
-	flag.StringVar(&mdsToken, "mds-token", "", "MDS auth token")
-	flag.StringVar(&localConfig, "local-config", common.DefaultLocalConfigDir, "Local config path")
-	flag.StringVar(&hostname, "hostname", "", "Hostname of the pod")
-	flag.BoolVar(&disableCapabilities, "disable-capabilities-restriction", false, "Disable capability restrictions")
-	flag.BoolVar(&disablePaths, "disable-paths", false, "Disable paths restrictions")
-	flag.BoolVar(&disableSeccomp, "disable-seccomp", false, "Disable seccomp restrictions")
-	dnsConfMode = pkgflag.MustNewPairList(map[string][]string{
-		"resolv": {"host", "stage0", "none", "default"},
-		"hosts":  {"host", "stage0", "default"},
-	}, map[string]string{
-		"resolv": "default",
-		"hosts":  "default",
-	})
-	flag.Var(dnsConfMode, "dns-conf-mode", "DNS config file modes")
-	flag.BoolVar(&mutable, "mutable", false, "Enable mutable operations on this pod, including starting an empty one")
+	flag.BoolVar(&mutable, "mutable", true, "Enable mutable operations on this pod, including starting an empty one")
 
 	// this ensures that main runs only on main thread (thread group leader).
 	// since namespace ops (unshare, setns) are done for a single thread, we
@@ -143,39 +121,6 @@ func init() {
 	if localhostIP == nil {
 		panic("localhost IP failed to parse")
 	}
-}
-
-// machinedRegister checks if nspawn should register the pod to machined
-func machinedRegister() bool {
-	// machined has a D-Bus interface following versioning guidelines, see:
-	// http://www.freedesktop.org/wiki/Software/systemd/machined/
-	// Therefore we can just check if the D-Bus method we need exists and we
-	// don't need to check the signature.
-	var found int
-
-	conn, err := dbus.SystemBus()
-	if err != nil {
-		return false
-	}
-	node, err := introspect.Call(conn.Object("org.freedesktop.machine1", "/org/freedesktop/machine1"))
-	if err != nil {
-		return false
-	}
-	for _, iface := range node.Interfaces {
-		if iface.Name != "org.freedesktop.machine1.Manager" {
-			continue
-		}
-		// machined v215 supports methods "RegisterMachine" and "CreateMachine" called by nspawn v215.
-		// machined v216+ (since commit 5aa4bb) additionally supports methods "CreateMachineWithNetwork"
-		// and "RegisterMachineWithNetwork", called by nspawn v216+.
-		for _, method := range iface.Methods {
-			if method.Name == "CreateMachineWithNetwork" || method.Name == "RegisterMachineWithNetwork" {
-				found++
-			}
-		}
-		break
-	}
-	return found == 2
 }
 
 func installAssets() error {
@@ -238,12 +183,12 @@ func installAssets() error {
 
 // getArgsEnv returns the nspawn or lkvm args and env according to the flavor
 // as the first two return values respectively.
-func getArgsEnv(p *stage1commontypes.Pod, flavor string, canMachinedRegister bool, debug bool, n *networking.Networking, insecureOptions stage1initcommon.Stage1InsecureOptions) ([]string, []string, error) {
+func getArgsEnv(p *oci.OCIPod, debug bool) ([]string, []string, error) {
 	var args []string
 	env := os.Environ()
 
-	// We store the pod's flavor so we can later garbage collect it correctly
-	if err := os.Symlink(flavor, filepath.Join(p.Root, stage1initcommon.FlavorFile)); err != nil {
+	// We store the pod's flavor for easy developer recognition when looking through pod dirs
+	if err := os.Symlink("oci", filepath.Join(p.Root, stage1initcommon.FlavorFile)); err != nil {
 		return nil, nil, errwrap.Wrap(errors.New("failed to create flavor symlink"), err)
 	}
 
@@ -251,26 +196,15 @@ func getArgsEnv(p *stage1commontypes.Pod, flavor string, canMachinedRegister boo
 	// to the host. Since systemd-v230, /etc/machine-id is mandatory, see
 	// https://github.com/systemd/systemd/commit/e01ff70a77e781734e1e73a2238af2e9bf7967a8
 	mPath := filepath.Join(common.Stage1RootfsPath(p.Root), "etc", "machine-id")
-	machineID := strings.Replace(p.UUID.String(), "-", "", -1)
+	machineID := strings.Replace(p.UUID, "-", "", -1)
 
 	args = append(args, filepath.Join(common.Stage1RootfsPath(p.Root), interpBin))
 	args = append(args, filepath.Join(common.Stage1RootfsPath(p.Root), nspawnBin))
 	args = append(args, "--boot")             // Launch systemd in the pod
 	args = append(args, "--notify-ready=yes") // From systemd v231
 
-	if context := os.Getenv(common.EnvSELinuxContext); context != "" {
-		args = append(args, fmt.Sprintf("-Z%s", context))
-	}
-
-	if context := os.Getenv(common.EnvSELinuxMountContext); context != "" {
-		args = append(args, fmt.Sprintf("-L%s", context))
-	}
-
-	if canMachinedRegister {
-		args = append(args, fmt.Sprintf("--register=true"))
-	} else {
-		args = append(args, fmt.Sprintf("--register=false"))
-	}
+	//TODO
+	args = append(args, fmt.Sprintf("--register=false"))
 
 	// use only dynamic libraries provided in the image
 	// from systemd v231 there's a new internal libsystemd-shared-v231.so
@@ -284,25 +218,8 @@ func getArgsEnv(p *stage1commontypes.Pod, flavor string, canMachinedRegister boo
 		log.FatalE("error writing /etc/machine-id", err)
 	}
 
-	// link journal only if the host is running systemd
-	if util.IsRunningSystemd() {
-		args = append(args, "--link-journal=try-guest")
-
-		keepUnit, err := util.RunningFromSystemService()
-		if err != nil {
-			if err == dlopen.ErrSoNotFound {
-				log.Print("warning: libsystemd not found even though systemd is running. Cgroup limits set by the environment (e.g. a systemd service) won't be enforced.")
-			} else {
-				return nil, nil, errwrap.Wrap(errors.New("error determining if we're running from a system service"), err)
-			}
-		}
-
-		if keepUnit {
-			args = append(args, "--keep-unit")
-		}
-	} else {
-		args = append(args, "--link-journal=no")
-	}
+	// TODO
+	args = append(args, "--link-journal=no")
 
 	if !debug {
 		args = append(args, "--quiet")             // silence most nspawn output (log_warning is currently not covered by this)
@@ -319,11 +236,7 @@ func getArgsEnv(p *stage1commontypes.Pod, flavor string, canMachinedRegister boo
 	// introduced by https://github.com/systemd/systemd/pull/3809.
 	env = append(env, "SYSTEMD_NSPAWN_USE_CGNS=no")
 
-	if len(privateUsers) > 0 {
-		args = append(args, "--private-users="+privateUsers)
-	}
-
-	nsargs, err := stage1initcommon.PodToNspawnArgs(p, insecureOptions)
+	nsargs, err := stage1initcommon.PodToNspawnArgs(p)
 	if err != nil {
 		return nil, nil, errwrap.Wrap(errors.New("failed to generate nspawn args"), err)
 	}
@@ -419,10 +332,12 @@ func stage1() int {
 		return 254
 	}
 
+	args, env, err := getArgsEnv(p, debug)
+
 	diag.Println(args)
 
 	err = stage1common.WithClearedCloExec(lfd, func() error {
-		return syscall.Exec(args[0], args, []string{})
+		return syscall.Exec(args[0], args, env)
 	})
 	if err != nil {
 		log.PrintE(fmt.Sprintf("failed to execute %q", args[0]), err)

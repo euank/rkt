@@ -155,10 +155,7 @@ func (uw *UnitWriter) Error() error {
 	return uw.err
 }
 
-func (uw *UnitWriter) AppUnit(
-	appName string, binPath, privateUsers string, insecureOptions Stage1InsecureOptions,
-	opts ...*unit.UnitOption,
-) {
+func (uw *UnitWriter) AppUnit(appName string, opts ...*unit.UnitOption) {
 	if uw.err != nil {
 		return
 	}
@@ -169,7 +166,8 @@ func (uw *UnitWriter) AppUnit(
 		return
 	}
 	appBundleRoot := filepath.Join(common.AppsPath(absRoot), appName)
-	execStartString := "/usr/bin/runc run --bundle " + appBundleRoot
+	runcName := uw.p.UUID + "-" + appName
+	execStartString := fmt.Sprintf("/usr/bin/runc run --bundle %v %v", appBundleRoot, runcName)
 	opts = append(opts, []*unit.UnitOption{
 		unit.NewUnitOption("Unit", "Description", fmt.Sprintf("Application=%v", appName)),
 		unit.NewUnitOption("Unit", "DefaultDependencies", "false"),
@@ -188,6 +186,7 @@ func (uw *UnitWriter) AppUnit(
 	//opts = append(opts, unit.NewUnitOption("Unit", "Requires", "sysusers.service"))
 	//opts = append(opts, unit.NewUnitOption("Unit", "After", "sysusers.service"))
 
+	log.Printf("writing unit file: %v", appName)
 	uw.WriteUnit(ServiceUnitPath(uw.p.Root, appName), "failed to create service unit file", opts...)
 	uw.Activate(ServiceUnitName(appName), ServiceWantPath(uw.p.Root, appName))
 }
