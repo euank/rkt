@@ -204,9 +204,9 @@ func getPod(dataDir string, uuid *types.UUID) (*Pod, error) {
 		{dir: p.preparedPath(), impliedStates: []*bool{&p.isPrepared}},
 		// For run, assume exited until the lock is tested
 		{dir: p.runPath(), impliedStates: []*bool{&p.isExited}},
-		{dir: p.garbagePath(), impliedStates: []*bool{&p.isGarbage}},
 		// Exited garbage implies exited
 		{dir: p.exitedGarbagePath(), impliedStates: []*bool{&p.isExitedGarbage, &p.isExited}},
+		{dir: p.garbagePath(), impliedStates: []*bool{&p.isGarbage}},
 	}
 
 	var l *lock.FileLock
@@ -560,75 +560,86 @@ func (p *Pod) refreshState() error {
 	// implies.
 	// Its order matches the order states occur.
 	dirStates := []struct {
-		dir           string
-		impliedStates []*bool
+		dir            string
+		unlockedStates []*bool
+		noLockedStates bool
+		lockedStates   []*bool
 	}{
-		{dir: p.embryoPath(), impliedStates: []*bool{&p.isEmbryo}},
-		// For prepare, assume it's aborted prepare until it gets updated below
-		{dir: p.preparePath(), impliedStates: []*bool{&p.isAbortedPrepare}},
-		{dir: p.preparedPath(), impliedStates: []*bool{&p.isPrepared}},
-		// For run, assume exited until the lock is tested
-		{dir: p.runPath(), impliedStates: []*bool{&p.isExited}},
-		{dir: p.garbagePath(), impliedStates: []*bool{&p.isGarbage}},
-		// Exited garbage implies exited
-		{dir: p.exitedGarbagePath(), impliedStates: []*bool{&p.isExitedGarbage, &p.isExited}},
+		{
+			dir:            p.embryoPath(),
+			unlockedStates: []*bool{&p.isEmbryo},
+			noLockedStates: true,
+		},
+		{
+			dir:            p.preparePath(),
+			lockedStates:   []*bool{&p.isPreparing},
+			unlockedStates: []*bool{&p.isAbortedPrepare},
+		},
+		{
+			dir:            p.preparedPath(),
+			unlockedStates: []*bool{&p.isPrepared},
+			noLockedStates: true,
+		},
+		{
+			dir:            p.runPath(),
+			lockedStates:   []*bool{}, // aka isRunning
+			unlockedStates: []*bool{&p.isExited},
+		},
+		{
+			dir:            p.exitedGarbagePath(),
+			lockedStates:   []*bool{&p.isExitedGarbage, &p.isExited, &p.isExitedDeleting},
+			unlockedStates: []*bool{&p.isExitedGarbage, &p.isExited},
+		},
+		{
+			dir:            p.garbagePath(),
+			lockedStates:   []*bool{&p.isGarbage, &p.isDeleting},
+			unlockedStates: []*bool{&p.isGarbage},
+		},
 	}
 
-	anyMatched := false
 	for _, dirState := range dirStates {
 		_, err := os.Stat(dirState.dir)
-		if err == nil {
-			for _, s := range dirState.impliedStates {
+		if err != nil {
+			if os.IsNotExist(err) {
+				// just try the next one if it didn't exist
+				continue
+			}
+			// Unknown error statting directory
+			return errwrap.Wrap(fmt.Errorf("error refreshing state of pod %q", p.UUID.String()), err)
+		}
+		if dirState.noLockedStates {
+			for _, s := range dirState.unlockedStates {
 				*s = true
 			}
-			anyMatched = true
-			break
+			return nil
 		}
-		if os.IsNotExist(err) {
-			// just try the next one if it didn't exist
-			continue
+
+		isLocked := true
+		// This directory exists, now check its lock
+		lockErr := p.TrySharedLock()
+		if lockErr == nil {
+			isLocked = false
+			p.Unlock()
 		}
-		// Unknown error statting directory
-		return errwrap.Wrap(fmt.Errorf("error refreshing state of pod %q", p.UUID.String()), err)
+		if lockErr != lock.ErrLocked {
+			p.Close()
+			return errwrap.Wrap(errors.New("unexpected lock error"), err)
+		}
+
+		if isLocked {
+			for _, s := range dirState.lockedStates {
+				*s = true
+			}
+		} else {
+			for _, s := range dirState.unlockedStates {
+				*s = true
+			}
+		}
+		break
 	}
 
-	if !anyMatched {
-		// default to isGone if nothing else matched
-		p.isGone = true
-		return nil
-	}
-
-	if p.isPrepared || p.isEmbryo {
-		// no need to try a shared lock for these; our state is already accurate
-		return nil
-	}
-
-	// preparing, run, and exitedGarbage dirs use exclusive locks to indicate preparing/aborted, running/exited, and deleting/marked
-	err := p.TrySharedLock()
-	if err == nil {
-		// if the lock isn't held, then the impliedState above is accurate so we can just return
-		p.Unlock()
-		return nil
-	}
-	if err != lock.ErrLocked {
-		p.Close()
-		return errwrap.Wrap(errors.New("unexpected lock error"), err)
-	}
-	if p.isExitedGarbage {
-		// locked exitedGarbage is also being deleted
-		p.isExitedDeleting = true
-	} else if p.isExited {
-		// locked exited and !exitedGarbage is not exited (default in the run dir)
-		p.isExited = false
-	} else if p.isAbortedPrepare {
-		// locked in preparing is preparing, not aborted (default in the preparing dir)
-		p.isAbortedPrepare = false
-		p.isPreparing = true
-	} else if p.isGarbage {
-		// locked in non-exited garbage is deleting
-		p.isDeleting = true
-	}
-
+	// default to isGone if nothing else matched
+	p.isGone = true
 	return nil
 }
 
