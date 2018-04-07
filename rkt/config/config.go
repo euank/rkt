@@ -316,10 +316,7 @@ func readFile(config *Config, info os.FileInfo, path string, kinds []string) err
 	} else if !valid {
 		return nil
 	}
-	if err := parseConfigFile(config, path, kinds); err != nil {
-		return err
-	}
-	return nil
+	return parseConfigFile(config, path, kinds)
 }
 
 func validConfigFile(info os.FileInfo) (bool, error) {
